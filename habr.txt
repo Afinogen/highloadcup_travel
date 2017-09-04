@@ -1,0 +1,516 @@
+Компания Mail.Ru предложила интересный чемпионат для backend-разработчиков: HighLoad Cup. Которое позволяет не только получить хорошие призы, но и поднять свой скилл backend-разработчика. Об опыте разработки и настройки окружения будет рассказано под катом. 
+<cut />
+<h3>1. Вводные данные</h3>
+Нужно написать быстрый сервер, который будет предоставлять Web-API для сервиса путешественников.
+
+В начальных данных для сервера есть три вида сущностей: User (Путешественник), Location (Достопримечательность), Visit (Посещения). У каждой свой набор полей.
+
+Необходимо реализовать следующие запросы:
+<pre>
+GET /<entity>/<id> для получения данных о сущности
+GET /users/<id>/visits для получения списка посещений пользователем
+GET /locations/<id>/avg для получения средней оценки достопримечательности
+POST /<entity>/<id> на обновление
+POST /<entity>/new на создание
+</pre>
+Максимальное штрафное время на запрос равно таймауту танка и составляет 2 секунды (2кк микросекунд).
+
+Решение должно быть в одном докер контейнере.
+Железо используемое для проверки:  Intel Xeon x86_64 2 GHz 4 ядра, 4 GB RAM, 10 GB HDD.
+
+Итак, задача по сути простая, но познания в докере - 0, опыт разработки под высокую нагрузку в районе 50%. 
+Для написания был выбран php7+nginx+mysql так как накопленный опыт можно было использовать в последующем в работе.
+
+<h3>2. Docker</h3>
+Разберемся что такое Docker.
+<blockquote>Docker — программное обеспечение для автоматизации развёртывания и управления приложениями в среде виртуализации на уровне операционной системы. Позволяет «упаковать» приложение со всем его окружением и зависимостями в контейнер, который может быть перенесён на любую Linux-систему с поддержкой cgroups в ядре, а также предоставляет среду по управлению контейнерами. </blockquote>
+Звучит просто отлично, если вкратце, то нам не нужно настраивать локально nginx/php/apache под каждый проект и не получать дополнительные зависимости от  других проектов. Например, есть сайт который не совместим с php7, чтобы с ним работать нужно переключать модуль php в apache2 на нужную версию. С докером все просто - запускаем контейнер с проектом и разрабатываем. Перешли на другой проект, останавливаем текущий контейнер и поднимаем новый.
+Идеология докера 1 процесс - 1 контейнер. То есть nginx с php в своем контейнере, mysql в своем. Для их объединения и настройки используется docker-compose.
+<spoiler title="Пример файла docker-compose.yml">
+<source lang="yaml">
+version: '2'
+services:
+ mysql:
+   image: mysql:5.7   #из официального репозитория
+   environment:
+     MYSQL_ROOT_PASSWORD: 12345   #установка root пароля
+   volumes:
+     - ./db:/var/lib/mysql # сохранение файлов БД на хосте
+   ports:
+     - 3306:3306  #настройка проброса портов - хост_машина:контейнер
+
+ nginx:
+   build:
+     context: ./
+     dockerfile: Dockerfile  #сборка из докер файла
+   depends_on: [mysql]   #установка зависимости
+   ports:
+     - 80:80
+   volumes:
+     - ./:/var/www/html #монтирование папки с исходным кодом, меняем его без перезапуска контейнера
+</source>
+</spoiler>
+Запускаем:
+<source lang="bash">docker-compose -f docker-compose.yml up</source>
+Все работает, подключение есть. Пробуем отправить на проверку решение иииии читаем внимательно задание - все должно быть в 1 контейнере. А контейнер в свою очередь работает пока жив процесс запущенный через команду CMD или ENTRYPOINT. Так как у нас несколько сервисов, нужно использовать диспетчер процессов - supervisord.
+<spoiler title="Конфигурация Dockerfile">
+<source lang="dockerfile">
+FROM ubuntu:17.10
+
+RUN apt-get update && apt-get -y upgrade \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y mysql-server mysql-client mysql-common  \
+    && rm -rf /var/lib/mysql && mkdir -p /var/lib/mysql /var/run/mysqld \
+    	&& chown -R mysql:mysql /var/lib/mysql /var/run/mysqld \
+    	&& chmod 777 /var/run/mysqld \
+    	&& rm /etc/mysql/my.cnf \
+    && 	apt-get install -y curl supervisor nginx \
+        php7.1-fpm php7.1-json \
+        php7.1-mysql php7.1-opcache \
+        php7.1-zip
+ADD ./config/mysqld.cnf /etc/mysql/my.cnf
+COPY config/www.conf /etc/php/7.1/fpm/pool.d/www.conf
+COPY config/nginx.conf 			/etc/nginx/nginx.conf
+COPY config/nginx-vhost.conf 		/etc/nginx/conf.d/default.conf
+COPY config/opcache.ini 		/etc/php/7.1/mods-available/opcache.ini
+COPY config/supervisord.conf 		/etc/supervisord.conf
+COPY scripts/ 				/usr/local/bin/
+COPY src /var/www/html     #необходимо чтобы исходники при старте проверки были уже внутри контейнера
+
+#Отладка
+#RUN mkdir /tmp/data /tmp/db
+#COPY data_full.zip /tmp/data/data.zip
+ENV PHP_MODULE_OPCACHE on
+ENV PHP_DISPLAY_ERRORS on
+
+RUN chmod 755 /usr/local/bin/docker-entrypoint.sh /usr/local/bin/startup.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh /usr/local/bin/startup.sh
+
+WORKDIR /var/www/html
+
+RUN service php7.1-fpm start
+
+EXPOSE 80 3306
+
+CMD ["/usr/local/bin/docker-entrypoint.sh"]
+</source>
+</spoiler>
+Команда CMD ["/usr/local/bin/docker-entrypoint.sh"]  производит небольшую конфигурацию окружения после старта контейнера и запуск менеджера процессов.
+<spoiler title="Настройка менеджера процессов">
+<source lang="ini">
+[unix_http_server]
+file=/var/run/supervisor.sock
+
+[supervisord]
+logfile=/tmp/supervisord.log
+logfile_maxbytes=50MB
+logfile_backups=10
+loglevel=info
+pidfile=/tmp/supervisord.pid
+nodaemon=false
+minfds=1024
+minprocs=200
+user=root
+
+[rpcinterface:supervisor]
+supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
+
+[supervisorctl]
+serverurl=unix:///var/run/supervisor.sock
+
+[program:php-fpm]
+command=/usr/sbin/php-fpm7.1
+autostart=true
+autorestart=true
+priority=5
+stdout_events_enabled=true
+stderr_events_enabled=true
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+
+[program:nginx]
+command=/usr/sbin/nginx -g "daemon off;"
+autostart=true
+autorestart=true
+priority=10
+stdout_events_enabled=true
+stderr_events_enabled=true
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+
+[program:mysql]
+command=mysqld_safe
+autostart=true
+autorestart=true
+priority=1
+stdout_events_enabled=true
+stderr_events_enabled=true
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+
+[program:startup]
+command=/usr/local/bin/startup.sh
+startretries=0
+priority=1100
+stdout_events_enabled=true
+stderr_events_enabled=true
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+</source>
+</spoiler>
+С помощью параметра priority можно менять очередность запуска, а stdout_logfile/stderr_logfile позволяют выводить логи сервисов в лог контейнера. Самым последним запускается скрипт startup.sh, в котором содержится заполнение базы данных данными из архива.
+Теперь наконец можно отправить свое детище на первую проверку. Команды докера похожи на git, для отправки используем:
+<source lang="bash">docker tag <ваш контейнер-решение> stor.highloadcup.ru/travels/<ваш репозиторий>
+docker push stor.highloadcup.ru/travels/<ваш репозиторий>
+</source>
+Так же можно зарегистрироваться на официальном сайте <a href="https://cloud.docker.com">https://cloud.docker.com</a> и добавлять контейнер туда.  Там можно настроить автоматическую сборку при обновлении ветки на github или bitbucket и дальше использовать уже готовый образ в других проектах в качестве основы.
+
+<h3>3. Разработка сервиса</h3>
+Для обеспечения высокой производительности было принято решение отказаться от всех фреймворков и использовать голый php + pdo. Фреймворк хоть и значительно облегчает разработку, но тянет за собой кучу зависимостей, которые используют время выполнения скрипта.
+Отправной точкой будет скрипт index.php с маршрутизацией запросов и отдачи результатов (Router + Controller). Использование url'ов вроде:
+<source lang="bash">/<entity>/<id></source>
+Cамо собой подразумевает использование регулярок для определения маршрута и параметров. Это очень гибко и позволяет легко расширять сервис. Но вариант на if'ах оказался быстрей (Хотя тут есть вероятность ошибки, почему? Читайте ниже).
+<spoiler title="index.php">
+<source lang="php">
+$uri = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
+
+$routes = explode('/', $uri);  //Получение сущности и параметров
+$entity = $routes[1] ?? 0;
+$id = $routes[2] ?? 0;
+$action = $routes[3] ?? 0;
+
+$className = __NAMESPACE__.'\\'.ucfirst($entity);
+if (!class_exists($className)) {  //проверка что такая сущность есть
+    header('HTTP/1.0 404 Not Found');
+    die();
+}
+
+$db = new \PDO(
+    'mysql:dbname=travel;host=localhost;port=3306', 'root', null, [
+        \PDO::MYSQL_ATTR_INIT_COMMAND => 'SET NAMES \'UTF8\'',
+        \PDO::ATTR_PERSISTENT         => true
+    ]
+);  //Подключение к БД
+
+/** @var \Travel\AbstractEntity $class */
+$class = new $className($db);
+//Обработка POST запросов (добавление/обновление данных)
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (isset($_SERVER['Content-Type'])) {   //Принимаем только json данные
+        $type = trim(explode(';', $_SERVER['Content-Type'])[0]);
+        if ($type !== 'application/json') {
+            header('HTTP/1.0 400 Bad Values');
+            die();
+        }
+    }
+    $inputJSON = file_get_contents('php://input');
+    $input = json_decode($inputJSON, true);
+    //Обновление
+    if ($input && $class->checkFields($input, $id !== 'new')) {
+        $itemId = (int)$id;
+        if ($itemId > 0 && $class->hasItem($itemId)) {
+            $class->update($input, $itemId);
+
+            header('Content-Type: application/json; charset=utf-8');
+            header('Content-Length: 2');
+            echo '{}';
+            die();
+        }
+
+        //Добавление нового элемента
+        if ($id === 'new') {
+            $class->insert($input);
+            header('Content-Type: application/json; charset=utf-8');
+            header('Content-Length: 2');
+            echo '{}';
+            die();
+        }
+        //иначе ничего не подошло - ошибка
+        header('HTTP/1.0 404 Not Found');
+        die();
+    }
+    //Или отправили плохие данные
+    header('HTTP/1.0 400 Bad Values');
+    die();
+}
+//Обработка GET запросов
+if ((int)$id > 0) {
+    if (!$action) { //нет никаких доп действий, просто возврат сущности
+        $res = $class->findById($id);
+        if ($res) {
+            $val = json_encode($class->hydrate($res));
+
+            header('Content-Type: application/json; charset=utf-8');
+            header('Content-Length: '.strlen($val));
+
+            echo $val;
+            die();
+        }
+
+        header('HTTP/1.0 404 Not Found');
+        die();
+    }
+   //иначе доп действия с сущностями
+    $res = $class->hasItem($id);
+    if (!$res) {
+        header('HTTP/1.0 404 Not Found');
+        die();
+    }
+    $filter = [];
+    if (!empty($_GET)) {   //Применение фильтра
+        $filter = $class->getFilter($_GET);
+        if (!$filter) {
+            header('HTTP/1.0 400 Bad Values');
+            die();
+        }
+    }
+
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode([$action => $class->{$action}($id, $filter)]);
+    die();
+}
+
+header('HTTP/1.0 404 Not Found');
+die();
+</source>
+</spoiler>
+Выглядит корявенько, но работает быстро. Далее основной класс для обработки данных AbstractEntity. Приводить его здесь не буду, так как там все банально просто - вставка/обновление/выборка. Весь исходный код можно посмотреть на GiHub'е. От него уже образуются классы с сущностями. Для примера возьмем сущность Пользователи.
+
+<b>Фильтр</b>
+В нем происходит проверка данных из GET запроса на валидность и формирование фильтра для запроса в бд.
+<source lang="php">public function getFilter(array $data)
+{
+        $columns = [
+            'fromDate'   => 'visited_at > ',
+            'toDate'     => 'visited_at < ',
+            'country'    => 'country = ',
+            'toDistance' => 'distance < ',
+        ];
+
+        $filter = [];
+
+        foreach ($data as $key => $datum) {
+            if (!isset($columns[$key])) {
+                return false;
+            }
+
+            if (($key === 'fromDate' || $key === 'toDate' || $key === 'toDistance') && !is_numeric($datum)) {
+                return false;
+            }
+            $filter[] = $columns[$key]."'".$datum."'";
+        }
+
+        return $filter;
+}</source>
+<b>Получение мест посещенных пользователем</b>
+Выводятся места и оценки для конкретного пользователя, так же может накладываться фильтр полученный выше.
+<source lang="php">public function visits(int $id, array $filter = [])
+{
+        $sql = 'select mark, visited_at, place from visits LEFT JOIN locations ON locations.id = visits.location where user = '.$id;
+
+        if (count($filter)) {
+            $sql .= ' and '.implode(' and ', $filter);
+        }
+
+        $sql .= ' order by visited_at asc';
+
+        $rows = $this->_db->query($sql);
+
+        if (!$rows) {
+            return false;
+        }
+
+        $items = $rows->fetchAll(\PDO::FETCH_ASSOC);
+        foreach ($items as &$item) {
+            $item['mark'] = (int)$item['mark'];
+            $item['visited_at'] = (int)$item['visited_at'];
+        }
+
+        return $items;
+}</source>
+<b>Вычисление возраста</b>
+Это, наверное, была самая обсуждаемая тема в чате телеграмма. Дата рождения пользователя задается в формате timestamp (кол-во секунд от начала Linux эпохи), например 12333444. Но отсчет-то идет с 1970 года, а есть еще люди, которые были рождены до 70-х. В таком случае timestamp будет отрицательным, например -123324. На пользователей может накладываться фильтр по возрасту, например, выбрать всех кто старше 18 лет. Для того чтобы не высчитывать каждый раз возраст при запросе в бд, я вычислил его перед добавлением пользователя в базу и сохранил в дополнительное поле.
+Функция вычисления возраста:
+<source lang="php">public static function getAge($y, $m, $d)
+{
+        if ($m > date('m', TEST_TIMESTAMP) || ($m == date('m', TEST_TIMESTAMP) && $d > date('d', TEST_TIMESTAMP))) {
+            return (date('Y', TEST_TIMESTAMP) - $y - 1);
+        }
+
+        return (date('Y', TEST_TIMESTAMP) - $y);
+}</source>
+"Костыль" с TEST_TIMESTAMP нужен для прохождения тестов, так как данные + ответы генерируются одновременно и неизменны в течении времени. Функция php date отлично преобразует отрицательный timestamp  в дату, учитывая високосные года.
+
+<b>База данных</b>
+Бд создана точно под сущности, все размеры полей были ТЗ. Движок бд InnoDb. На поля участвующие в фильтре или сортировке были добавлены индексы.
+
+<b>Настройка веб-сервера и бд</b>
+Для улучшения производительности были использованы настройки найденные в интернете, они должны были стать началом откуда крутить ручку тонкой настройки сервисов.
+
+<h3>4. Обработка отчетов, корректировка настроек сервисов</h3>
+Исходный код на php получился минимального размера и быстро стало понятно, что я из backend-разработчика превращаюсь в сисадмина. Экспресс-тесты запускаются на малом объеме данных и больше служат для проверки корректности ответов, чем для проверки приложения под нагрузкой. А полноценные тесты можно было запускать только 2 раза в 12 часов. Тестирование на своем компьютере приводило не всегда к понятным результатам - у меня могло работать быстро, а на проверке падать с ошибкой 502. Из-за этого я не смог настроить memcached, что должно было ускорить ответы сервера.
+Единственным положительным моментом стало использование движка MyISAM вместо InnoDb. Тесты выдали 133 штрафные секунды, вместо 250 на InnoDb.
+Теперь о том что не дало хорошо настроить конфигурацию nginx/mysql/php-fpm - <a href="https://github.com/sat2707/hlcupdocs/issues/45">Значительный разброс результатов одного решения в разное время суток</a>. Это основательно меня расстроило, так как у меня тоже был разброс по результатам вечер/утро на одно и тоже решение. Я не знаю как у них была устроенна инфраструктура "боевой" проверки, но очевидно, что что-то могло мешать и нагружать машину (возможно подготовка следующего решения на запуск). А когда счет идет уже на миллисекунды в рейтинге, становится невозможным точно настроить сервер.
+Ниже приведены конфигурации на которых я остановился:
+<spoiler title="mysql">
+<source lang="Ini">
+[mysqld_safe]
+socket		= /var/run/mysqld/mysqld.sock
+nice		= 0
+
+[mysqld]
+#
+# * Basic Settings
+#
+user		= mysql
+pid-file	= /var/run/mysqld/mysqld.pid
+socket		= /var/run/mysqld/mysqld.sock
+port		= 3306
+basedir		= /usr
+datadir		= /var/lib/mysql
+tmpdir		= /tmp
+lc-messages-dir	= /usr/share/mysql
+skip-external-locking
+#
+# Instead of skip-networking the default is now to listen only on
+# localhost which is more compatible and is not less secure.
+bind-address		= 127.0.0.1
+#
+# * Fine Tuning
+#
+key_buffer_size		= 16M
+max_allowed_packet	= 16M
+thread_stack		= 192K
+thread_cache_size       = 32
+sort_buffer_size = 256K
+read_buffer_size = 128K
+read_rnd_buffer_size = 256K
+myisam_sort_buffer_size = 64M
+myisam_use_mmap = 1
+
+myisam-recover-options  = BACKUP
+table_open_cache       = 64
+#
+# * Query Cache Configuration
+#
+query_cache_limit	= 10M
+query_cache_size        = 64M
+query_cache_type = 1
+
+join_buffer_size = 4M
+#
+# Error log - should be very few entries.
+#
+log_error = /var/log/mysql/error.log
+expire_logs_days	= 10
+max_binlog_size   = 100M
+
+#
+# * InnoDB
+#
+innodb_buffer_pool_size = 2048M
+innodb_log_file_size = 256M
+innodb_log_buffer_size = 16M
+innodb_flush_log_at_trx_commit = 2
+innodb_thread_concurrency = 8
+innodb_read_io_threads = 64
+innodb_write_io_threads = 64
+innodb_io_capacity = 50000
+innodb_flush_method = O_DIRECT
+transaction-isolation = READ-COMMITTED
+innodb_support_xa = 0
+innodb_commit_concurrency = 8
+innodb_old_blocks_time = 1000
+</source>
+</spoiler>
+<spoiler title="nginx">
+<source lang="Ini">
+user  www-data;
+worker_processes  auto;
+
+error_log  /var/log/nginx/error.log warn;
+pid        /var/run/nginx.pid;
+
+events {
+    worker_connections  2048;
+    multi_accept on;
+    use epoll;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
+
+    sendfile        on;
+    tcp_nodelay on;
+    tcp_nopush     on;
+    access_log off;
+
+    client_max_body_size 50M;
+    client_body_buffer_size 1m;
+    client_body_timeout 15;
+    client_header_timeout 15;
+    keepalive_timeout 2 2;
+    send_timeout 15;
+
+    open_file_cache          max=2000 inactive=20s;
+    open_file_cache_valid    60s;
+    open_file_cache_min_uses 5;
+    open_file_cache_errors   off;
+
+    gzip_static on;
+    gzip  on;
+    gzip_vary  on;
+    gzip_min_length     1400;
+    gzip_buffers        16 8k;
+    gzip_comp_level   6;
+    gzip_http_version 1.1;
+    gzip_proxied any;
+    gzip_disable "MSIE [1-6]\.(?!.*SV1)";
+    gzip_types  text/plain text/css application/x-javascript text/xml application/xml application/xml+rss text/javascript application/json image/svg+xml svg svgz;
+
+    include /etc/nginx/conf.d/*.conf;
+}
+</source>
+</spoiler>
+<spoiler title="nginx-vhost">
+<source lang="Ini">server {
+    listen 80;
+    server_name _;
+
+    chunked_transfer_encoding off;
+
+    root /var/www/html;
+    index index.php index.html index.htm;
+
+    error_log /var/log/nginx/error.log crit;
+
+    location / {
+        try_files $uri $uri/ /index.php?$args;
+    }
+
+    location ~ \.php$ {
+        try_files $uri =404;
+        include /etc/nginx/fastcgi_params;
+        fastcgi_pass    unix:/var/run/php/php7.1-fpm.sock;
+        fastcgi_index   index.php;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_read_timeout 3s;
+    }
+}</source>
+</spoiler>
+В php-fpm не удалось ни чего конкретного достичь.
+
+<h2>5. Выводы</h2>
+Я рад, что участвовал в этом чемпионате. Понял принцип работы докера, более глубокую настройку серверов под высокие нагрузки. А так же мне понравился соревновательных дух и общение в чате телеграмма. За все время чемпионата в топе были программисты с++ и go. Можно было последовать примеру и так же писать на любом из этих языков. Но мне хотелось посмотреть на свои результаты в том, что я знаю и с чем работаю. Спасибо Mail.Ru за это. 

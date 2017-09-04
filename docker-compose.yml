@@ -1,0 +1,22 @@
+version: '2'
+services:
+ mysql:
+   image: mysql:5.7
+   environment:
+     MYSQL_ROOT_PASSWORD: 12345
+   volumes:
+     - ./db:/var/lib/mysql # сохранение файлов БД на хосте
+   ports:
+     - 3307:3306
+
+ nginx:
+   build:
+     context: ./
+     dockerfile: Dockerfile
+   depends_on: [mysql]
+   ports:
+     - 8081:80
+   volumes:
+     - ./:/var/www/html
+     - ./log:/var/log
+     - ./lognginx:/var/log/nginx
